@@ -1,72 +1,232 @@
 import os
+import re
+import time
+import html
 import asyncio
-from dotenv import load_dotenv
+import logging
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from aiogram.enums import ParseMode
 
 from google import genai
 
-load_dotenv("/opt/gemini/.env")
+# -------------------- CONFIG --------------------
+load_dotenv("/opt/gemini/.env")  # подстрой путь если нужно
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing in .env")
-
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 if not GEMINI_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing in .env")
+    raise RuntimeError("GEMINI_API_KEY missing")
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+# Сколько сообщений хранить в контексте на пользователя (в каждую сторону)
+MAX_TURNS = int(os.getenv("MAX_TURNS", "10"))  # 10 пар user+bot ~= 20 сообщений
 
-# Gemini client
+# Rate limit: N запросов за WINDOW секунд
+RATE_N = int(os.getenv("RATE_N", "8"))
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
+
+# Глобальный лимит параллельных запросов к Gemini
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+
+# Таймаут на один запрос к Gemini
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "Ты — полезный ассистент в Telegram. "
+    "Не утверждай про сервер/ОС/окружение, если тебе это явно не передали. "
+    "Не проси и не раскрывай секреты (ключи, токены, .env). "
+    "Пиши кратко и по делу."
+)
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("tg-gemini-bot")
+
+# -------------------- GEMINI CLIENT --------------------
 client = genai.Client(api_key=GEMINI_KEY)
+sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-def extract_text(resp) -> str:
-    # быстрый путь
-    if getattr(resp, "text", None):
-        return resp.text
+# -------------------- STATE (in-memory) --------------------
+@dataclass
+class UserState:
+    model: str
+    history: Deque[Tuple[str, str]]  # ("user"|"model", text)
+    rate: Deque[float]              # timestamps
 
-    # fallback на candidates.parts
-    cands = getattr(resp, "candidates", None) or []
-    for c in cands:
-        content = getattr(c, "content", None)
-        parts = getattr(content, "parts", None) or []
-        for p in parts:
-            t = getattr(p, "text", None)
-            if t:
-                return t
-    return "Не смог сформировать ответ (пустой ответ от модели)."
+users: Dict[int, UserState] = {}
 
-async def ask_gemini(prompt: str) -> str:
-    # ВАЖНО: generate_content синхронный — уводим в thread, чтобы не блокировать бота
-    resp = await asyncio.to_thread(
-        client.models.generate_content,
-        model=MODEL,
-        contents=prompt
-    )
-    return extract_text(resp)
+def get_user(uid: int) -> UserState:
+    st = users.get(uid)
+    if not st:
+        st = UserState(model=DEFAULT_MODEL, history=deque(maxlen=MAX_TURNS * 2), rate=deque())
+        users[uid] = st
+    return st
 
+# -------------------- HELPERS --------------------
+def rate_limit_ok(st: UserState) -> bool:
+    now = time.time()
+    # удаляем старые
+    while st.rate and now - st.rate[0] > RATE_WINDOW:
+        st.rate.popleft()
+    if len(st.rate) >= RATE_N:
+        return False
+    st.rate.append(now)
+    return True
+
+def md_bold_to_html(text: str) -> str:
+    """
+    Безопасный рендер:
+    - сначала экранируем HTML
+    - затем конвертим **bold** -> <b>bold</b>
+    """
+    safe = html.escape(text)
+    safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
+    return safe
+
+def tg_split(text: str, limit: int = 3800) -> List[str]:
+    # Telegram 4096, но оставим запас
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    cur = 0
+    while cur < len(text):
+        parts.append(text[cur:cur + limit])
+        cur += limit
+    return parts
+
+def build_contents(st: UserState, user_text: str):
+    """
+    Собираем контекст в формат, понятный Gemini:
+    contents = [system + история + текущий запрос]
+    """
+    contents = []
+    contents.append(SYSTEM_PROMPT)
+
+    for role, txt in st.history:
+        # txt уже простой текст
+        contents.append(f"{role}: {txt}")
+
+    contents.append(f"user: {user_text}")
+    return contents
+
+async def gemini_generate(model: str, contents) -> str:
+    """
+    Вызов Gemini в отдельном thread, с таймаутом, семафором и ретраями.
+    """
+    async with sem:
+        for attempt in range(1, 4):
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(client.models.generate_content, model=model, contents=contents),
+                    timeout=GEMINI_TIMEOUT
+                )
+                # resp.text иногда None -> достаём руками
+                if getattr(resp, "text", None):
+                    return resp.text
+
+                cands = getattr(resp, "candidates", None) or []
+                for c in cands:
+                    content = getattr(c, "content", None)
+                    parts = getattr(content, "parts", None) or []
+                    for p in parts:
+                        t = getattr(p, "text", None)
+                        if t:
+                            return t
+
+                return "Пустой ответ от модели."
+            except asyncio.TimeoutError:
+                log.warning("Gemini timeout (attempt %s)", attempt)
+                if attempt == 3:
+                    return "Таймаут ответа от Gemini. Попробуй ещё раз."
+            except Exception as e:
+                log.exception("Gemini error (attempt %s): %s", attempt, e)
+                if attempt == 3:
+                    return f"Ошибка Gemini: {type(e).__name__}"
+                await asyncio.sleep(0.8 * attempt)
+
+# -------------------- AIROGRAM --------------------
 dp = Dispatcher()
 
 @dp.message(F.text == "/start")
 async def start(m: Message):
-    await m.answer("Привет! Напиши вопрос — я спрошу Gemini и отвечу.")
+    st = get_user(m.from_user.id)
+    await m.answer(
+        "Привет! Пиши вопрос — отвечу через Gemini.\n"
+        "Команды:\n"
+        "/reset — сбросить контекст\n"
+        "/model — показать текущую модель\n"
+        "/model <name> — установить модель\n"
+        "/help — помощь"
+    )
+
+@dp.message(F.text == "/help")
+async def help_(m: Message):
+    await m.answer(
+        "Я отвечаю через Gemini.\n"
+        "Команды:\n"
+        "/reset — очистить контекст\n"
+        "/model — текущая модель\n"
+        "/model <name> — сменить модель\n\n"
+        f"Лимит: {RATE_N} запросов за {RATE_WINDOW} сек."
+    )
+
+@dp.message(F.text == "/reset")
+async def reset(m: Message):
+    st = get_user(m.from_user.id)
+    st.history.clear()
+    await m.answer("Ок, контекст сброшен.")
+
+@dp.message(F.text.startswith("/model"))
+async def model_cmd(m: Message):
+    st = get_user(m.from_user.id)
+    parts = m.text.split(maxsplit=1)
+    if len(parts) == 1:
+        await m.answer(f"Текущая модель: <code>{html.escape(st.model)}</code>", parse_mode=ParseMode.HTML)
+        return
+    new_model = parts[1].strip()
+    st.model = new_model
+    await m.answer(f"Ок, модель: <code>{html.escape(st.model)}</code>", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text)
 async def handle_text(m: Message):
-    q = m.text.strip()
+    uid = m.from_user.id
+    st = get_user(uid)
+
+    q = (m.text or "").strip()
     if not q:
         return
+
+    if not rate_limit_ok(st):
+        await m.answer("Слишком часто. Подожди немного 🙂")
+        return
+
     await m.chat.do("typing")
-    try:
-        answer = await ask_gemini(q)
-        # Telegram ограничивает длину сообщения; подрежем аккуратно
-        if len(answer) > 3800:
-            answer = answer[:3800] + "…"
-        await m.answer(answer, parse_mode="HTML")
-    except Exception as e:
-        await m.answer(f"Ошибка при обращении к Gemini: {type(e).__name__}: {e}")
+
+    contents = build_contents(st, q)
+    answer = await gemini_generate(st.model, contents)
+
+    # сохраняем в историю
+    st.history.append(("user", q))
+    st.history.append(("model", answer))
+
+    # безопасно в HTML + поддержка **bold**
+    out = md_bold_to_html(answer)
+
+    for chunk in tg_split(out):
+        await m.answer(chunk, parse_mode=ParseMode.HTML)
 
 async def main():
     bot = Bot(token=BOT_TOKEN)
