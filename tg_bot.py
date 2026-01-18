@@ -15,7 +15,12 @@ from aiogram.enums import ParseMode
 
 from google import genai
 
+from storage import Storage
+
 # -------------------- CONFIG --------------------
+
+storage = Storage()
+
 load_dotenv("/opt/gemini/.env")  # подстрой путь если нужно
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -185,9 +190,27 @@ async def help_(m: Message):
 
 @dp.message(F.text == "/reset")
 async def reset(m: Message):
-    st = get_user(m.from_user.id)
-    st.history.clear()
-    await m.answer("Ок, контекст сброшен.")
+    await storage.ctx_clear(m.from_user.id)
+    await m.answer("Ок, контекст сброшен (быстрая память).")
+
+
+@dp.message(F.text.startswith("/remember "))
+async def remember(m: Message):
+    fact = m.text.split(" ", 1)[1].strip()
+    if not fact:
+        await m.answer("Напиши так: /remember я люблю питон")
+        return
+    await storage.add_fact(m.from_user.id, fact, confidence=80)
+    await m.answer("Запомнил ✅")
+
+@dp.message(F.text == "/memory")
+async def memory(m: Message):
+    uid = m.from_user.id
+    summary = await storage.get_summary(uid) or "—"
+    facts = await storage.list_facts(uid, limit=10)
+    txt = "Память:\n" + summary + "\n\nФакты:\n" + ("\n".join(f"- {f}" for f in facts) if facts else "—")
+    await m.answer(txt)
+
 
 @dp.message(F.text.startswith("/model"))
 async def model_cmd(m: Message):
@@ -203,32 +226,52 @@ async def model_cmd(m: Message):
 @dp.message(F.text)
 async def handle_text(m: Message):
     uid = m.from_user.id
-    st = get_user(uid)
 
-    q = (m.text or "").strip()
-    if not q:
-        return
-
-    if not rate_limit_ok(st):
+    # антифлуд
+    ok = await storage.rate_limit_ok(uid, RATE_N, RATE_WINDOW)
+    if not ok:
         await m.answer("Слишком часто. Подожди немного 🙂")
         return
 
-    await m.chat.do("typing")
+    # чтобы один юзер не запускал 5 запросов параллельно
+    if not await storage.acquire_lock(uid, ttl_sec=30):
+        await m.answer("Подожди, я ещё отвечаю на прошлый запрос 🙂")
+        return
 
-    contents = build_contents(st, q)
-    answer = await gemini_generate(st.model, contents)
+    try:
+        model = DEFAULT_MODEL  # или твоя логика выбора модели
+        await storage.ensure_user(uid, m.from_user.username, m.from_user.first_name, model)
 
-    # сохраняем в историю
-    st.history.append(("user", q))
-    st.history.append(("model", answer))
+        ctx = await storage.ctx_get(uid)
+        summary = await storage.get_summary(uid)
+        facts = await storage.list_facts(uid, limit=10)
 
-    # безопасно в HTML + поддержка **bold**
-    out = md_bold_to_html(answer)
+        contents = [SYSTEM_PROMPT]
+        if summary:
+            contents.append(f"memory_summary: {summary}")
+        if facts:
+            contents.append("user_facts:\n" + "\n".join(f"- {f}" for f in facts))
 
-    for chunk in tg_split(out):
-        await m.answer(chunk, parse_mode=ParseMode.HTML)
+        for role, txt in ctx:
+            contents.append(f"{role}: {txt}")
+        contents.append(f"user: {q}")
+
+        answer = await gemini_generate(model, contents)
+
+        # сохраняем в MySQL
+        await storage.save_message(uid, "user", q)
+        await storage.save_message(uid, "model", answer)
+
+        # сохраняем быстрый контекст в Redis
+        await storage.ctx_append(uid, "user", q)
+        await storage.ctx_append(uid, "model", answer)
+
+    finally:
+        await storage.release_lock(uid)
+
 
 async def main():
+    await storage.init_mysql()
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
