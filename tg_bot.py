@@ -227,6 +227,10 @@ async def model_cmd(m: Message):
 async def handle_text(m: Message):
     uid = m.from_user.id
 
+    q = (m.text or "").strip()
+    if not q:
+        return
+        
     # антифлуд
     ok = await storage.rate_limit_ok(uid, RATE_N, RATE_WINDOW)
     if not ok:
