@@ -14,6 +14,7 @@ from aiogram.types import Message
 from aiogram.enums import ParseMode
 
 from google import genai
+from google.genai import types
 
 from storage import Storage
 
@@ -112,20 +113,37 @@ def tg_split(text: str, limit: int = 3800) -> List[str]:
         cur += limit
     return parts
 
-def build_contents(st: UserState, user_text: str):
-    """
-    Собираем контекст в формат, понятный Gemini:
-    contents = [system + история + текущий запрос]
-    """
-    contents = []
-    contents.append(SYSTEM_PROMPT)
+def build_contents(history: list[tuple[str, str]], user_text: str):
+    contents: list[types.Content] = []
 
-    for role, txt in st.history:
-        # txt уже простой текст
-        contents.append(f"{role}: {txt}")
-
-    contents.append(f"user: {user_text}")
+    for role in history:
+        role_norm = "model" if role in ("model", "assistant") else "user"
+        contents.append(
+            types.Content(
+                role=role_norm,
+                parts=[types.Part.from_text(text=txt)],
+            )
+        )
+    
+    contents.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=txt)])
+    )
     return contents
+
+# def build_contents(st: UserState, user_text: str):
+#     """
+#     Собираем контекст в формат, понятный Gemini:
+#     contents = [system + история + текущий запрос]
+#     """
+#     contents = []
+#     contents.append(SYSTEM_PROMPT)
+
+#     for role, txt in st.history:
+#         # txt уже простой текст
+#         contents.append(f"{role}: {txt}")
+
+#     contents.append(f"user: {user_text}")
+#     return contents
 
 async def gemini_generate(model: str, contents) -> str:
     """
@@ -134,23 +152,40 @@ async def gemini_generate(model: str, contents) -> str:
     async with sem:
         for attempt in range(1, 4):
             try:
+                config = types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                )
+
                 resp = await asyncio.wait_for(
-                    asyncio.to_thread(client.models.generate_content, model=model, contents=contents),
+                    asyncio.to_thread(client.models.generate_content, model=model, contents=contents, config=config),
                     timeout=GEMINI_TIMEOUT
                 )
                 # resp.text иногда None -> достаём руками
-                if getattr(resp, "text", None):
-                    return resp.text
+                text = getattr(resp, "text", None)
+                if not text:
+                    return text
+
+                fc = getattr(resp, "function_calls", None)
+                if fc:
+                    return "Модель попыталась вызвать инструмент (function calling), но в боте это отключено/не поддерживается."
 
                 cands = getattr(resp, "candidates", None) or []
                 for c in cands:
                     content = getattr(c, "content", None)
+                    if not content:
+                        continue
                     parts = getattr(content, "parts", None) or []
                     for p in parts:
                         t = getattr(p, "text", None)
                         if t:
                             return t
+                try:
+                    dump = resp.model_dump()
+                except Exception:
+                    dump = str(resp)
 
+                log.warning("Gemini returned empty response: %s", dump)
                 return "Пустой ответ от модели."
             except asyncio.TimeoutError:
                 log.warning("Gemini timeout (attempt %s)", attempt)
@@ -247,10 +282,11 @@ async def handle_text(m: Message):
         await storage.ensure_user(uid, m.from_user.username, m.from_user.first_name, model)
 
         ctx = await storage.ctx_get(uid)
+        contents = build_contents(ctx, q)
         summary = await storage.get_summary(uid)
         facts = await storage.list_facts(uid, limit=10)
 
-        contents = [SYSTEM_PROMPT]
+        
         if summary:
             contents.append(f"memory_summary: {summary}")
         if facts:
