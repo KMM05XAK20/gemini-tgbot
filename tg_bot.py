@@ -112,22 +112,30 @@ def tg_split(text: str, limit: int = 3800) -> List[str]:
         parts.append(text[cur:cur + limit])
         cur += limit
     return parts
-
+    
 def build_contents(history: list[tuple[str, str]], user_text: str):
+    """
+    history: список кортежей (role, text), где role in {"user","model"}.
+    user_text: текущий текст пользователя
+    """
     contents: list[types.Content] = []
 
-    for role in history:
+    for role, text in history:
         role_norm = "model" if role in ("model", "assistant") else "user"
         contents.append(
             types.Content(
                 role=role_norm,
-                parts=[types.Part.from_text(text=txt)],
+                parts=[types.Part.from_text(text=text)],
             )
         )
-    
+
     contents.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=txt)])
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_text)],
+        )
     )
+
     return contents
 
 # def build_contents(st: UserState, user_text: str):
