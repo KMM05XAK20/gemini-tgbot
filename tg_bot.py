@@ -226,24 +226,24 @@ async def model_cmd(m: Message):
 @dp.message(F.text)
 async def handle_text(m: Message):
     uid = m.from_user.id
-
     q = (m.text or "").strip()
     if not q:
         return
-        
-    # антифлуд
+
+    # ACK чтобы бот не "молчал"
+    ack = await m.answer("Думаю…")
+
     ok = await storage.rate_limit_ok(uid, RATE_N, RATE_WINDOW)
     if not ok:
-        await m.answer("Слишком часто. Подожди немного 🙂")
+        await ack.edit_text("Слишком часто. Подожди немного 🙂")
         return
 
-    # чтобы один юзер не запускал 5 запросов параллельно
     if not await storage.acquire_lock(uid, ttl_sec=30):
-        await m.answer("Подожди, я ещё отвечаю на прошлый запрос 🙂")
+        await ack.edit_text("Подожди, я ещё отвечаю 🙂")
         return
 
     try:
-        model = DEFAULT_MODEL  # или твоя логика выбора модели
+        model = DEFAULT_MODEL
         await storage.ensure_user(uid, m.from_user.username, m.from_user.first_name, model)
 
         ctx = await storage.ctx_get(uid)
@@ -255,20 +255,29 @@ async def handle_text(m: Message):
             contents.append(f"memory_summary: {summary}")
         if facts:
             contents.append("user_facts:\n" + "\n".join(f"- {f}" for f in facts))
-
         for role, txt in ctx:
             contents.append(f"{role}: {txt}")
         contents.append(f"user: {q}")
 
-        answer = await gemini_generate(model, contents)
+        # ВАЖНО: обернём Gemini в таймаут
+        try:
+            answer = await asyncio.wait_for(
+                gemini_generate(model, contents),
+                timeout=GEMINI_TIMEOUT + 5
+            )
+        except asyncio.TimeoutError:
+            answer = "Таймаут ответа от Gemini. Попробуй ещё раз."
 
-        # сохраняем в MySQL
         await storage.save_message(uid, "user", q)
         await storage.save_message(uid, "model", answer)
-
-        # сохраняем быстрый контекст в Redis
         await storage.ctx_append(uid, "user", q)
         await storage.ctx_append(uid, "model", answer)
+
+        await ack.edit_text(answer)
+
+    except Exception:
+        log.exception("handle_text failed")
+        await ack.edit_text("Упс, ошибка на сервере. Я уже в логах 🙂")
 
     finally:
         await storage.release_lock(uid)
