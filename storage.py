@@ -13,6 +13,8 @@ class Storage:
         self.mysql_pool: Optional[aiomysql.Pool] = None
         self.ctx_ttl = int(os.getenv("CTX_TTL_SECONDS", "604800"))
         self.max_turns = int(os.getenv("CTX_MAX_TURNS", "10"))
+    
+    
 
     async def init_mysql(self):
         self.mysql_pool = await aiomysql.create_pool(
@@ -29,6 +31,20 @@ class Storage:
     # -------- Redis: context --------
     def _ctx_key(self, user_id: int) -> str:
         return f"ctx:{user_id}"
+
+    def _cnt_key(self, user_id: int) -> str:
+        return f"cnt:{user_id}"
+
+    async def inc_user_msg_count(self, user_id: int, ttc_sec: int = 2592000) -> int:
+        """
+        Счётчик сообщений пользователя. TTL = 30 дней по умолчанию.
+        Возвращает текущее значение после инкремента.
+        """
+
+        key = self._cnt_key(user_id)
+        val = await self.redis.incr(key)
+        await self.redis.expire(key, ttc_sec)
+        return int(val)
 
     async def ctx_get(self, user_id: int) -> List[Tuple[str, str]]:
         items = await self.redis.lrange(self._ctx_key(user_id), 0, -1)
@@ -122,6 +138,26 @@ class Storage:
                     (user_id, summary),
                 )
 
+    async def last_messages(self, user_id: int, limit: int = 40) -> list[tuple[str, str]]:
+        assert self.mysql_pool
+
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT role, text
+                    FROM messages
+                    WHERE user_id=%s
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (user_id, limit),
+                    
+                )
+                rows = await cur.fetchall()
+        rows.reverse()
+        return [(r[0], r[1]) for r in rows]
+
     async def add_fact(self, user_id: int, fact: str, confidence: int = 70) -> None:
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
@@ -141,3 +177,10 @@ class Storage:
                 )
                 rows = await cur.fetchall()
                 return [r[0] for r in rows]
+
+    async def clear_long_memory(self, user_id: int) -> None:
+        assert self.mysql_pool
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM summaries WHERE user_id=%s", (user_id,))
+                await cur.execute("DELETE FROM user_facts WHERE user_id=%s", (user_id,))

@@ -54,6 +54,9 @@ SYSTEM_PROMPT = os.getenv(
     "Пиши кратко и по делу."
 )
 
+SUMMARY_EVERY = int(os.getenv("SUMMARY_EVERY", "20"))   # раз в 20 user-сообщений
+SUMMARY_LAST_N = int(os.getenv("SUMMARY_LAST_N", "60")) # сколько последних сообщений учитывать
+
 # -------------------- LOGGING --------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -112,7 +115,7 @@ def tg_split(text: str, limit: int = 3800) -> List[str]:
         parts.append(text[cur:cur + limit])
         cur += limit
     return parts
-    
+
 def build_contents(history: list[tuple[str, str]], user_text: str):
     """
     history: список кортежей (role, text), где role in {"user","model"}.
@@ -236,6 +239,13 @@ async def reset(m: Message):
     await storage.ctx_clear(m.from_user.id)
     await m.answer("Ок, контекст сброшен (быстрая память).")
 
+@dp.message(F.text == "/forget")
+async def forget(m: Message):
+    uid = m.from_user.id
+    await storage.ctx_clear(uid)
+    await storage.clear_long_memory(uid)
+    await m.answer("Ок, удалил память (summary + факты) и быстрый контекст.")
+
 
 @dp.message(F.text.startswith("/remember "))
 async def remember(m: Message):
@@ -253,6 +263,54 @@ async def memory(m: Message):
     facts = await storage.list_facts(uid, limit=10)
     txt = "Память:\n" + summary + "\n\nФакты:\n" + ("\n".join(f"- {f}" for f in facts) if facts else "—")
     await m.answer(txt)
+
+
+async def update_summary_if_needed(uid: int, model: str):
+    # считаем только user-сообщения
+    n = await storage.inc_user_msg_count(uid)
+    if n % SUMMARY_EVERY != 0:
+        return
+
+    old = await storage.get_summary(uid) or ""
+    last = await storage.last_messages(uid, limit=SUMMARY_LAST_N)
+
+    # краткий, строгий промпт
+    prompt_contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(
+                text=(
+                    "Обнови краткую память диалога. "
+                    "Сохраняй только устойчивые факты, цели, предпочтения пользователя, "
+                    "и текущий контекст задач. "
+                    "Не добавляй ничего от себя. "
+                    "Пиши коротко, пунктами.\n\n"
+                    f"Текущая память:\n{old}\n\n"
+                    "Новые сообщения (хронологически):\n" +
+                    "\n".join([f"{r}: {t}" for r, t in last])
+                )
+            )]
+        )
+    ]
+
+    config = types.GenerateContentConfig(
+        system_instruction="Ты — модуль памяти. Твоя задача: кратко обновлять summary.",
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+    resp = await asyncio.to_thread(
+        client.models.generate_content,
+        model=model,
+        contents=prompt_contents,
+        config=config,
+    )
+
+    new_sum = getattr(resp, "text", None) or ""
+    new_sum = new_sum.strip()
+    if new_sum:
+        await storage.set_summary(uid, new_sum)
+        await storage.ctx_clear(uid)  # важное: сбрасываем Redis контекст
+
 
 
 @dp.message(F.text.startswith("/model"))
@@ -325,6 +383,7 @@ async def handle_text(m: Message):
 
     finally:
         await storage.release_lock(uid)
+        update_summary_if_needed(uid, model)
 
 
 async def main():
