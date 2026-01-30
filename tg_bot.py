@@ -224,8 +224,8 @@ async def start(m: Message):
     uid = m.from_user.id
     st = get_user(uid)
     await storage.ensure_user(uid, m.from_user.username, m.from_user.first_name, st.model)
-    await storage.log_event(st, "start")
-    await storage.touch_user(st)
+    await storage.log_event(uid, "start")
+    await storage.touch_user(uid)
 
     await m.answer(
         "Привет! Пиши вопрос — отвечу через Gemini.\n"
