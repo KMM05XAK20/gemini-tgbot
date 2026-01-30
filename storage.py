@@ -232,7 +232,7 @@ class Storage:
 
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
-            async with conn.cursor as cur:
+            async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO events(user_id, event_type, meta) VALUES (%s, %s, %s)",
                     (user_id, event_type, json.dump(meta) if meta else None),
