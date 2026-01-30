@@ -221,8 +221,9 @@ dp = Dispatcher()
 
 @dp.message(F.text == "/start")
 async def start(m: Message):
-    st = get_user(m.from_user.id)
-    await storage.ensure_user(st, m.from_user.username, m.from_user.first_name, DEFAULT_MODEL)
+    uid = m.from_user.id
+    st = get_user(uid)
+    await storage.ensure_user(uid, m.from_user.username, m.from_user.first_name, st.model)
     await storage.log_event(st, "start")
     await storage.touch_user(st)
 
