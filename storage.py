@@ -184,3 +184,31 @@ class Storage:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM summaries WHERE user_id=%s", (user_id,))
                 await cur.execute("DELETE FROM user_facts WHERE user_id=%s", (user_id,))
+
+    async def touch_user(self, user_id: int):
+        assert self.mysql_pool
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET last_seen=NOW() WHERE user_id=%s",
+                    (user_id,),
+                )
+
+    async def inc_messages(self, user_id: int):
+        assert self.mysql_pool
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET messages_count=messages_count+1 WHERE user_id=%s",
+                    (user_id,),
+                )
+
+    async def log_event(self, user_id: int, event_type: str, meta: dict | None = None):
+        assert self.mysql_pool
+        async with self.mysql_pool.acquire() as conn:
+            async with conn.cursor as cur:
+                await cur.execute(
+                    "INSERT INTO events(user_id, event_type, meta) VALUES (%s, %s, %s)",
+                    (user_id, event_type, json.dump(meta) if meta else None),
+                )
+

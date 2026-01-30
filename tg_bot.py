@@ -26,6 +26,7 @@ load_dotenv("/opt/gemini/.env")  # подстрой путь если нужно
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_IDS = os.getenv("1190756443")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 if not BOT_TOKEN:
@@ -208,12 +209,22 @@ async def gemini_generate(model: str, contents) -> str:
                     return f"Ошибка Gemini: {type(e).__name__}"
                 await asyncio.sleep(0.8 * attempt)
 
+
+
+async def use_ai(uid: int) -> bool:
+    
+    return True
+
 # -------------------- AIROGRAM --------------------
 dp = Dispatcher()
 
 @dp.message(F.text == "/start")
 async def start(m: Message):
     st = get_user(m.from_user.id)
+    await storage.ensure_user(st, m.from_user.username, m.from_user.first_name, DEFAULT_MODEL)
+    await storage.log_event(st, "start")
+    await storage.touch_user(st)
+
     await m.answer(
         "Привет! Пиши вопрос — отвечу через Gemini.\n"
         "Команды:\n"
@@ -324,9 +335,44 @@ async def model_cmd(m: Message):
     st.model = new_model
     await m.answer(f"Ок, модель: <code>{html.escape(st.model)}</code>", parse_mode=ParseMode.HTML)
 
+
+@dp.message(F.text == "/stats")
+async def stats(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+
+    async with storage.mysql_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM users")
+            users_total = (await cur.fetchone())[0]
+
+            await cur.execute(
+                "SELECT COUNT(*) FROM users WHERE last_seen > NOW() - INTERVAL 1 DAY"
+            )
+            dau = (await cur.fetchone())[0]
+
+            await cur.execute(
+                "SELECT COUNT(*) FROM users WHERE last_seen > NOW() - INTERVAL 7 DAY"
+            )
+            wau = (await cur.fetchone())[0]
+
+            await cur.execute(
+                "SELECT COUNT(*) FROM users WHERE last_seen > NOW() - INTERVAL 30 DAY"
+            )
+            mau = (await cur.fetchone())[0]
+
+    await m.answer(
+        f"📊 Статистика:\n"
+        f"👤 Всего пользователей: {users_total}\n"
+        f"🔥 DAU: {dau}\n"
+        f"📈 WAU: {wau}\n"
+        f"🌍 MAU: {mau}"
+    )
+
 @dp.message(F.text)
 async def handle_text(m: Message):
     uid = m.from_user.id
+    await storage.touch_user(uid)
     q = (m.text or "").strip()
     if not q:
         return
@@ -374,6 +420,8 @@ async def handle_text(m: Message):
         await storage.save_message(uid, "model", answer)
         await storage.ctx_append(uid, "user", q)
         await storage.ctx_append(uid, "model", answer)
+        await storage.inc_messages(uid)
+        await storage.log_event(uid, "message")
 
         await ack.edit_text(answer)
 
