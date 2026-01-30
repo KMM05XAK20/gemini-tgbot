@@ -171,7 +171,7 @@ async def gemini_generate(model: str, contents, system_instruction: str) -> str:
                 )
 
                 resp = await asyncio.to_thread(
-                    client.model.generate_content,
+                    client.models.generate_content,
                     contents=contents,
                     config=config,
                 )
