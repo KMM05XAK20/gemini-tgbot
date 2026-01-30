@@ -34,12 +34,19 @@ class Storage:
 
     def _cnt_key(self, user_id: int) -> str:
         return f"cnt:{user_id}"
+    
+    def _require_int_user_id(self, user_id):
+        if not isinstance(user_id, int):
+            raise TypeError(f"user_id must be int, got {type(user_id)}: {user_id!r}")
+
 
     async def inc_user_msg_count(self, user_id: int, ttc_sec: int = 2592000) -> int:
         """
         Счётчик сообщений пользователя. TTL = 30 дней по умолчанию.
         Возвращает текущее значение после инкремента.
         """
+        self._require_int_user_id(user_id)
+
 
         key = self._cnt_key(user_id)
         val = await self.redis.incr(key)
@@ -47,6 +54,8 @@ class Storage:
         return int(val)
 
     async def ctx_get(self, user_id: int) -> List[Tuple[str, str]]:
+        self._require_int_user_id(user_id)
+
         items = await self.redis.lrange(self._ctx_key(user_id), 0, -1)
         out: List[Tuple[str, str]] = []
         for s in items:
@@ -55,6 +64,7 @@ class Storage:
         return out
 
     async def ctx_append(self, user_id: int, role: str, text: str) -> None:
+        self._require_int_user_id(user_id)
         key = self._ctx_key(user_id)
         await self.redis.rpush(key, json.dumps({"role": role, "text": text}, ensure_ascii=False))
         await self.redis.expire(key, self.ctx_ttl)
@@ -72,6 +82,7 @@ class Storage:
         return f"rl:{user_id}"
 
     async def rate_limit_ok(self, user_id: int, limit: int, window_sec: int) -> bool:
+        self._require_int_user_id(user_id)
         key = self._rl_key(user_id)
         now = time.time()
         pipe = self.redis.pipeline()
@@ -94,6 +105,7 @@ class Storage:
 
     # -------- MySQL --------
     async def ensure_user(self, user_id: int, username: str | None, first_name: str | None, model: str) -> None:
+        self._require_int_user_id(user_id)
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -110,6 +122,7 @@ class Storage:
                 )
 
     async def save_message(self, user_id: int, role: str, text: str) -> None:
+        self._require_int_user_id(user_id)
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -119,6 +132,7 @@ class Storage:
                 )
 
     async def get_summary(self, user_id: int) -> Optional[str]:
+        self._require_int_user_id(user_id)
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -127,6 +141,7 @@ class Storage:
                 return row[0] if row else None
 
     async def set_summary(self, user_id: int, summary: str) -> None:
+        self._require_int_user_id(user_id)
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -139,6 +154,7 @@ class Storage:
                 )
 
     async def last_messages(self, user_id: int, limit: int = 40) -> list[tuple[str, str]]:
+        self._require_int_user_id(user_id)
         assert self.mysql_pool
 
         async with self.mysql_pool.acquire() as conn:
@@ -159,6 +175,8 @@ class Storage:
         return [(r[0], r[1]) for r in rows]
 
     async def add_fact(self, user_id: int, fact: str, confidence: int = 70) -> None:
+        self._require_int_user_id(user_id)
+
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -168,6 +186,8 @@ class Storage:
                 )
 
     async def list_facts(self, user_id: int, limit: int = 10) -> List[str]:
+        self._require_int_user_id(user_id)
+
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -179,6 +199,8 @@ class Storage:
                 return [r[0] for r in rows]
 
     async def clear_long_memory(self, user_id: int) -> None:
+        self._require_int_user_id(user_id)
+
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -195,6 +217,8 @@ class Storage:
                 )
 
     async def inc_messages(self, user_id: int):
+        self._require_int_user_id(user_id)
+
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -204,6 +228,8 @@ class Storage:
                 )
 
     async def log_event(self, user_id: int, event_type: str, meta: dict | None = None):
+        self._require_int_user_id(user_id)
+
         assert self.mysql_pool
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor as cur:

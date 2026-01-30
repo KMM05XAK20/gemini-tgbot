@@ -157,7 +157,7 @@ def build_contents(history: list[tuple[str, str]], user_text: str):
 #     contents.append(f"user: {user_text}")
 #     return contents
 
-async def gemini_generate(model: str, contents) -> str:
+async def gemini_generate(model: str, contents, system_instruction: str) -> str:
     """
     Вызов Gemini в отдельном thread, с таймаутом, семафором и ретраями.
     """
@@ -165,13 +165,14 @@ async def gemini_generate(model: str, contents) -> str:
         for attempt in range(1, 4):
             try:
                 config = types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=system_instruction,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 )
 
-                resp = await asyncio.wait_for(
-                    asyncio.to_thread(client.models.generate_content, model=model, contents=contents, config=config),
-                    timeout=GEMINI_TIMEOUT
+                resp = await asyncio.to_thread(
+                    client.model.generate_content,
+                    contents=contents,
+                    config=config,
                 )
                 # resp.text иногда None -> достаём руками
                 text = getattr(resp, "text", None)
@@ -398,19 +399,11 @@ async def handle_text(m: Message):
         summary = await storage.get_summary(uid)
         facts = await storage.list_facts(uid, limit=10)
 
-        
-        if summary:
-            contents.append(f"memory_summary: {summary}")
-        if facts:
-            contents.append("user_facts:\n" + "\n".join(f"- {f}" for f in facts))
-        for role, txt in ctx:
-            contents.append(f"{role}: {txt}")
-        contents.append(f"user: {q}")
 
         # ВАЖНО: обернём Gemini в таймаут
         try:
             answer = await asyncio.wait_for(
-                gemini_generate(model, contents),
+                gemini_generate(model, contents, system_plus_memory),
                 timeout=GEMINI_TIMEOUT + 5
             )
         except asyncio.TimeoutError:
