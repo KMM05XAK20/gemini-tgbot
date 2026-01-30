@@ -161,6 +161,7 @@ async def gemini_generate(model: str, contents, system_instruction: str) -> str:
     """
     Вызов Gemini в отдельном thread, с таймаутом, семафором и ретраями.
     """
+
     async with sem:
         for attempt in range(1, 4):
             try:
@@ -400,6 +401,17 @@ async def handle_text(m: Message):
         summary = await storage.get_summary(uid)
         facts = await storage.list_facts(uid, limit=10)
 
+        memory_lines = []
+        if summary:
+            memory_lines.append("memory_summary:\n" + summary)
+        
+        if facts:
+            memory_lines.append("user_facts:\n" + "\n".join(f"- {f}" for f in facts))
+
+        system_plus_memory = SYSTEM_PROMPT
+
+        if memory_lines:
+            system_plus_memory += "\n\n" + "\n\n".join(memory_lines)
 
         # ВАЖНО: обернём Gemini в таймаут
         try:
@@ -425,7 +437,7 @@ async def handle_text(m: Message):
 
     finally:
         await storage.release_lock(uid)
-        update_summary_if_needed(uid, model)
+        asyncio.create_task(update_summary_if_needed(uid, model))
 
 
 async def main():
