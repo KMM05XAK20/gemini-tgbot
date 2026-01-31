@@ -26,7 +26,6 @@ load_dotenv("/opt/gemini/.env")  # подстрой путь если нужно
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_IDS = os.getenv("1190756443")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 if not BOT_TOKEN:
@@ -141,6 +140,14 @@ def build_contents(history: list[tuple[str, str]], user_text: str):
     )
 
     return contents
+
+def parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_ID", "").strip()
+    if not raw:
+        return set()
+    return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+ADMIN_IDS = parse_admin_ids()
 
 # def build_contents(st: UserState, user_text: str):
 #     """
@@ -340,9 +347,14 @@ async def model_cmd(m: Message):
     await m.answer(f"Ок, модель: <code>{html.escape(st.model)}</code>", parse_mode=ParseMode.HTML)
 
 
+
+@dp.message(F.text == "/id")
+async def my_id(m:Message):
+    await m.answer(f"Твой id:  {m.from_user.id}")
+
 @dp.message(F.text == "/stats")
 async def stats(m: Message):
-    if m.from_user.id not in ADMIN_IDS:
+    if not ADMIN_IDS or m.from_user.id not in ADMIN_IDS:
         return
 
     async with storage.mysql_pool.acquire() as conn:
